@@ -4,7 +4,8 @@ Twice-daily Slack (or email) digests of your Slurm jobs, so you stop running `sq
 every twenty minutes.
 
 One message at 08:00 and one at 20:00 covering every job you have queued or running,
-plus everything that finished since the previous report. For each job: **job id,
+plus everything that finished since the previous report — and, optionally, a message
+within a couple of minutes of each new submission. For each job: **job id,
 submit time, a one-line summary, current status, estimated-or-actual start, and
 estimated-or-actual finish.**
 
@@ -74,6 +75,33 @@ written to `~/.config/slurm-monitor/config.json` with mode `600`, and `.gitignor
 `config.json` out of git. If you would rather not store it on disk at all, export
 `SLACK_WEBHOOK_URL` instead; the environment always wins over the config file.
 
+### Submission alerts
+
+Alongside the digests, the tool can announce jobs as you submit them:
+
+```bash
+./slurm_monitor.py --watch      # one poll; the first run seeds silently
+```
+
+`--install-cron` schedules this every `watch_interval_minutes` (default 2) by default;
+pass `--no-watch` if you only want the digests. Each poll is a single `squeue -u $USER`
+costing about 90 ms, and it prints and logs nothing unless there is something new, so it
+does not fill your log or lean on the scheduler.
+
+It works by diffing the queue against a ledger of job ids it has already announced
+(`~/.local/state/slurm-monitor/seen_jobs.json`), which means it catches submissions
+however they happen — `sbatch` by hand, a loop inside a script, job dependencies firing,
+a submission from a *different* login node. Nothing about how you submit has to change.
+Several jobs submitted at once arrive as one message, not a burst.
+
+Two consequences of the polling approach worth knowing:
+
+- The **first run seeds the ledger silently** rather than announcing everything already in
+  your queue. `--reset-watch` clears the ledger if you ever want to start over.
+- A job that is submitted *and finishes* inside one poll interval never appears in
+  `squeue`, so it is not announced. It still turns up in the next digest, which reads
+  `sacct`.
+
 ### Schedule it
 
 ```bash
@@ -82,8 +110,9 @@ written to `~/.config/slurm-monitor/config.json` with mode `600`, and `.gitignor
 crontab -l
 ```
 
-The entry carries `CRON_TZ`, so the times mean what your configured `timezone` says they
-mean regardless of the node's clock. Re-running `--install-cron` replaces the old entry
+Two entries go in: the digest at the hours you chose, and the submission poll. The digest
+entry carries `CRON_TZ`, so the times mean what your configured `timezone` says they mean
+regardless of the node's clock. Re-running `--install-cron` replaces the old entry
 rather than stacking a second one. `--uninstall-cron` removes it.
 
 **Cron is per-login-node.** The crontab lives on whichever login node you ran the command
@@ -133,6 +162,7 @@ mails you per event, this mails you a periodic view of everything at once.
 | `email.from` / `email.to` | `""` | Verified sender / your address |
 | `user` | `$USER` | Slurm account to report on |
 | `timezone` | `"Asia/Taipei"` | IANA name; used for timestamps and `CRON_TZ` |
+| `watch_interval_minutes` | `2` | Poll interval `--install-cron` uses for submission alerts |
 | `finished_lookback_hours` | `14` | How far back the *first* report looks for finished jobs |
 | `max_finished` | `15` | Cap on finished jobs listed per report |
 | `queue_context` | `true` | Add queue position and typical wait to pending jobs |
@@ -149,8 +179,11 @@ Point `$SLURM_MONITOR_CONFIG` elsewhere to use a different config file.
 | `--dry-run` | Print to stdout, send nothing, don't advance the state cursor |
 | `--channel {slack,email,stdout}` | Override the configured channel for one run |
 | `--test` | Send a short "it works" message |
+| `--watch` | Poll once for newly submitted jobs and announce them |
+| `--reset-watch` | Clear the seen-jobs ledger; the next `--watch` re-seeds silently |
 | `--set-webhook URL` | Store a Slack webhook in the config file (mode 600) |
-| `--install-cron` / `--uninstall-cron` | Manage the schedule |
+| `--install-cron` / `--uninstall-cron` | Manage the schedule (digest + submission alerts) |
+| `--no-watch` | With `--install-cron`, schedule the digest only |
 | `--hours 8,20` | Cron hours for `--install-cron` |
 | `--since 2026-09-13T08:00` | Report jobs finished since a specific time (doesn't advance the cursor) |
 
@@ -226,6 +259,9 @@ there too:
 ```bash
 tail ~/.local/state/slurm-monitor/monitor.log
 ```
+
+**Submission alerts stopped but digests still arrive.** The ledger may have been seeded
+while the queue was in an odd state — `--reset-watch`, then run `--watch` once to re-seed.
 
 **No report arrived.** Check `crond` is up (`systemctl is-active crond`), that `crontab -l`
 still shows the entry, and that you're on the login node where you installed it.

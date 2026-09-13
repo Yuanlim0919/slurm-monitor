@@ -36,6 +36,7 @@ STATE_DIR = os.path.join(HOME, ".local/state/slurm-monitor")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOG_PATH = os.path.join(STATE_DIR, "monitor.log")
 CACHE_PATH = os.path.join(STATE_DIR, "wait_cache.json")
+SEEN_PATH = os.path.join(STATE_DIR, "seen_jobs.json")
 
 DEFAULTS = {
     "channel": "slack",           # slack | email | stdout
@@ -50,6 +51,7 @@ DEFAULTS = {
     "timezone": "Asia/Taipei",
     "finished_lookback_hours": 14,  # floor for "recently finished" window
     "max_finished": 15,
+    "watch_interval_minutes": 2,    # how often --watch polls for new submissions
     "queue_context": True,          # add queue position + historical wait to PENDING jobs
     "wait_stats_days": 21,          # history window for the typical-wait figures
     "wait_stats_min_sample": 10,    # below this many samples, report no wait stats
@@ -119,6 +121,23 @@ def save_state(state):
     with open(tmp, "w") as fh:
         json.dump(state, fh, indent=2)
     os.replace(tmp, STATE_PATH)
+
+
+def load_seen():
+    try:
+        with open(SEEN_PATH) as fh:
+            data = json.load(fh)
+        return data.get("jobs", {}), data.get("seeded", False)
+    except Exception:
+        return {}, False
+
+
+def save_seen(jobs, seeded=True):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = SEEN_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"seeded": seeded, "jobs": jobs}, fh, indent=2)
+    os.replace(tmp, SEEN_PATH)
 
 
 def log(msg):
@@ -714,6 +733,65 @@ def deliver(cfg, channel, header, sections):
     raise SystemExit("Unknown channel: %s" % channel)
 
 
+def run_watch(cfg, channel, tz, dry_run=False):
+    """One poll for newly submitted jobs. Meant to run from a short-interval cron.
+
+    Announces only job ids never seen before. The first run seeds the ledger
+    silently, so installing this does not dump your existing queue into Slack.
+
+    A job that is submitted and finishes inside one poll interval never appears
+    in squeue and so is not announced here -- it still shows up in the next
+    digest, which reads sacct.
+    """
+    now = int(time.time())
+    seen, seeded = load_seen()
+    active = fetch_active(cfg["user"])
+    current = dict((str(j["job_id"]), j) for j in active)
+
+    if not seeded:
+        save_seen(dict((jid, now) for jid in current), seeded=True)
+        msg = "watch seeded with %d existing job(s); nothing sent" % len(current)
+        log(msg)
+        if dry_run:
+            print(msg)
+        return msg
+
+    new_ids = [jid for jid in current if jid not in seen]
+
+    # keep the ledger bounded: anything still queued, plus anything seen in the
+    # last 24h (so a job leaving the queue cannot be re-announced on a blip)
+    ledger = dict((jid, seen.get(jid, now)) for jid in current)
+    for jid, first in seen.items():
+        if jid not in ledger and now - first < 86400:
+            ledger[jid] = first
+
+    if not new_ids:
+        if not dry_run:
+            save_seen(ledger)
+        return "no new jobs"
+
+    new_jobs = [current[jid] for jid in new_ids]
+    new_jobs.sort(key=lambda j: j["submit"])
+
+    ctx = QueueContext(cfg) if cfg.get("queue_context", True) else None
+    partitions = set(j["partition"].split(",")[0].strip()
+                     for j in new_jobs if j.get("partition"))
+    plural = "" if len(new_jobs) == 1 else "s"
+    header = ("*Job%s submitted* · %s  —  %d new"
+              % (plural, datetime.fromtimestamp(now, tz).strftime("%a %d %b %H:%M %Z"),
+                 len(new_jobs)))
+    sections = []
+    for job in new_jobs:
+        headline, lines = job_lines(job, now, tz, None, ctx=ctx, partitions=partitions)
+        sections.append(headline + "\n" + "\n".join("        " + ln for ln in lines))
+
+    result = deliver(cfg, channel, header, sections)
+    if not dry_run:
+        save_seen(ledger)
+    log("watch: announced %d new job(s) via %s (%s)" % (len(new_jobs), channel, result))
+    return result
+
+
 # --------------------------------------------------------------------------
 # cron
 # --------------------------------------------------------------------------
@@ -749,15 +827,20 @@ def strip_managed(text):
     return "\n".join(out).strip()
 
 
-def install_cron(cfg, hours="8,20"):
+def install_cron(cfg, hours="8,20", watch=True):
     script = os.path.abspath(__file__)
     python = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
     tz = cfg.get("timezone") or "Asia/Taipei"
-    entry = "\n".join([
+    lines = [
         CRON_TAG,
         "CRON_TZ=%s" % tz,
         "0 %s * * * %s %s >> %s 2>&1" % (hours, python, script, LOG_PATH),
-    ])
+    ]
+    if watch:
+        every = max(1, int(cfg.get("watch_interval_minutes", 2)))
+        spec = "*" if every == 1 else "*/%d" % every
+        lines.append("%s * * * * %s %s --watch >> %s 2>&1" % (spec, python, script, LOG_PATH))
+    entry = "\n".join(lines)
     body = strip_managed(current_crontab())
     new = (body + "\n\n" if body else "") + entry + "\n"
     write_crontab(new)
@@ -778,6 +861,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the report instead of sending")
     ap.add_argument("--channel", choices=["slack", "email", "stdout"], help="override config channel")
     ap.add_argument("--test", action="store_true", help="send a short test message and exit")
+    ap.add_argument("--watch", action="store_true",
+                    help="poll once for newly submitted jobs and announce them")
+    ap.add_argument("--no-watch", action="store_true",
+                    help="with --install-cron, schedule only the digest")
+    ap.add_argument("--reset-watch", action="store_true",
+                    help="forget the seen-jobs ledger; the next --watch re-seeds silently")
     ap.add_argument("--install-cron", action="store_true", help="schedule 08:00 and 20:00")
     ap.add_argument("--uninstall-cron", action="store_true", help="remove the schedule")
     ap.add_argument("--hours", default="8,20", help="cron hours for --install-cron (default 8,20)")
@@ -809,7 +898,15 @@ def main():
         print("Removed slurm-monitor cron entries.")
         return
     if args.install_cron:
-        print("Installed:\n%s" % install_cron(cfg, args.hours))
+        print("Installed:\n%s" % install_cron(cfg, args.hours, watch=not args.no_watch))
+        return
+
+    if args.reset_watch:
+        try:
+            os.remove(SEEN_PATH)
+        except OSError:
+            pass
+        print("Watch ledger cleared; the next --watch run will re-seed silently.")
         return
 
     channel = args.channel or ("stdout" if args.dry_run else cfg["channel"])
@@ -823,6 +920,10 @@ def main():
 
     if not cfg["user"]:
         raise SystemExit("Cannot determine user; set \"user\" in %s" % CONFIG_PATH)
+
+    if args.watch:
+        run_watch(cfg, channel, tz, dry_run=args.dry_run)
+        return
 
     now = int(time.time())
     state = load_state()
