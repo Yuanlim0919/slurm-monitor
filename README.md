@@ -13,8 +13,10 @@ Slurm report · Sun 13 Sep 2026 22:18 CST  —  4 pending · 2 finished since We
 
 358841 stormer_patch4_convproj — gb200-r1 · 4 nodes · 16 GPU · limit 1d 0h
         status: PENDING (Priority)
-        submitted: Tue 08 Sep 20:29 (5d 1h ago)
-        est. start: unknown — queued 5d 1h, scheduler gives no estimate
+        submitted: Tue 08 Sep 20:29 (5d 2h ago)
+        est. start: unknown — queued 5d 2h, scheduler gives no estimate
+        queue position: 22nd of 27 by priority (21 ahead, 2,291 node-h requested)
+        typical wait: 2-4 node jobs here — median 13m, p90 12h (n=999, 21d) — already past p90
         est. finish: unknown — 1d 0h of wall time after it starts
         script: train_stormer_patch4_convproj_gb200r1.sh
 
@@ -133,6 +135,9 @@ mails you per event, this mails you a periodic view of everything at once.
 | `timezone` | `"Asia/Taipei"` | IANA name; used for timestamps and `CRON_TZ` |
 | `finished_lookback_hours` | `14` | How far back the *first* report looks for finished jobs |
 | `max_finished` | `15` | Cap on finished jobs listed per report |
+| `queue_context` | `true` | Add queue position and typical wait to pending jobs |
+| `wait_stats_days` | `21` | History window for the typical-wait figures |
+| `wait_stats_min_sample` | `10` | Below this many past jobs, report no wait figures |
 
 Point `$SLURM_MONITOR_CONFIG` elsewhere to use a different config file.
 
@@ -170,6 +175,49 @@ The tool never invents a number. If the scheduler returns `StartTime=Unknown` �
 busy clusters with no backfill window for large jobs — the report says so plainly rather
 than guessing.
 
+### Why pending jobs get a position and a range, not an ETA
+
+The obvious idea is to estimate a start time from the work queued ahead of you. It is
+computable, and the tool computes half of it — but as a *predicted start time* it does
+not survive contact with a real cluster, for three reasons.
+
+**Submission order barely matters.** Under `priority/multifactor`, jobs are ranked by
+priority, not arrival. On the cluster this was built for, `PriorityWeightFairShare` is
+1,000,000 against `PriorityWeightAge` at 10,000 — fairshare outweighs waiting by 100×.
+Priority is also a moving target: one job here went from 59737 to 22675 in twenty minutes
+without anything happening to it, purely from fairshare decay.
+
+**Requested walltime is not runtime.** Draining the queue ahead of you takes
+`node-hours-ahead / partition-capacity`, but only if jobs run as long as they asked.
+Measured over 1326 completed jobs in 21 days:
+
+| | |
+|---|---|
+| node-hours **used** vs **requested** | 7765 / 74953 = **0.10** |
+| jobs using <25% of their limit | **90%** |
+| jobs using ≥90% of their limit | 4% |
+
+People request 12h and run for 40 minutes. On that cluster the naive estimate came to 67
+hours where the walltime-corrected one came to 7 — a number whose value is set almost
+entirely by a fudge factor, which is a poor thing to plan around. Backfill makes this
+worse (better, really): short jobs continuously jump the queue into gaps.
+
+**The real distribution is too wide for a point estimate.** Observed waits for 5–8 node
+jobs on one partition: median 1.7h, p90 25.8h, max 97h. Any single predicted timestamp is
+wrong by an order of magnitude in one direction or the other.
+
+So pending jobs get two measured facts instead of one invented one — where you sit in the
+priority order right now, and what jobs your size have historically waited on that
+partition. Together they answer the question you actually have: *am I close, and is this
+normal?* When a job has already waited longer than the p90 for its size, the line says
+`already past p90` — that is your signal that something unusual is going on (usually a
+fairshare wall, sometimes a QOS or reservation limit) and `scontrol show job <id>` is
+worth a look.
+
+Cost: one extra `squeue` per partition per report, and one `sacct` history pass cached for
+24h in `~/.local/state/slurm-monitor/wait_cache.json`. A full report takes well under a
+second. Set `"queue_context": false` to turn all of it off.
+
 ## Troubleshooting
 
 Every run appends to `~/.local/state/slurm-monitor/monitor.log`, and cron failures land
@@ -184,6 +232,11 @@ still shows the entry, and that you're on the login node where you installed it.
 
 **"Slack webhook returned 403/404".** The webhook was revoked or the app was removed from
 the workspace. Make a new one and re-run `--set-webhook`.
+
+**No `typical wait` line.** Either fewer than `wait_stats_min_sample` comparable jobs ran
+in the history window, or `sacct -a` is restricted for your account on this cluster — some
+sites disallow reading other users' accounting. Queue position still works; it only needs
+`squeue`.
 
 **`squeue: unrecognized option '--json'`.** Slurm is older than 23.11. Nothing to be done
 short of parsing `squeue -O` output instead.

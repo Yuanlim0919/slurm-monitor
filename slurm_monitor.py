@@ -35,6 +35,7 @@ CONFIG_PATH = os.environ.get(
 STATE_DIR = os.path.join(HOME, ".local/state/slurm-monitor")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 LOG_PATH = os.path.join(STATE_DIR, "monitor.log")
+CACHE_PATH = os.path.join(STATE_DIR, "wait_cache.json")
 
 DEFAULTS = {
     "channel": "slack",           # slack | email | stdout
@@ -49,6 +50,9 @@ DEFAULTS = {
     "timezone": "Asia/Taipei",
     "finished_lookback_hours": 14,  # floor for "recently finished" window
     "max_finished": 15,
+    "queue_context": True,          # add queue position + historical wait to PENDING jobs
+    "wait_stats_days": 21,          # history window for the typical-wait figures
+    "wait_stats_min_sample": 10,    # below this many samples, report no wait stats
 }
 
 TERMINAL_STATES = {
@@ -86,8 +90,11 @@ def deep_merge(base, override):
 def load_config():
     cfg = dict(DEFAULTS)
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as fh:
-            cfg = deep_merge(cfg, json.load(fh))
+        try:
+            with open(CONFIG_PATH) as fh:
+                cfg = deep_merge(cfg, json.load(fh))
+        except ValueError as exc:
+            raise SystemExit("Config file %s is not valid JSON: %s" % (CONFIG_PATH, exc))
     # environment always wins, so secrets can stay out of the file
     if os.environ.get("SLACK_WEBHOOK_URL"):
         cfg["slack_webhook_url"] = os.environ["SLACK_WEBHOOK_URL"]
@@ -163,6 +170,60 @@ def fmt_dur(seconds):
     return "%s%dm" % (sign, mins)
 
 
+def parse_slurm_duration(text):
+    """[D-]HH:MM:SS or MM:SS -> seconds. 0 for UNLIMITED/INVALID/blank."""
+    text = (text or "").strip()
+    if not text or text in ("UNLIMITED", "INVALID", "NOT_SET", "Partition_Limit", "N/A"):
+        return 0
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return 0
+    parts = text.split(":")
+    try:
+        nums = [int(x) for x in parts]
+    except ValueError:
+        return 0
+    if len(nums) == 3:
+        return days * 86400 + nums[0] * 3600 + nums[1] * 60 + nums[2]
+    if len(nums) == 2:
+        return days * 86400 + nums[0] * 60 + nums[1]
+    if len(nums) == 1:
+        return days * 86400 + nums[0] * 60
+    return 0
+
+
+def fmt_hours(hours):
+    if hours < 1:
+        return "%dm" % int(round(hours * 60))
+    if hours < 10:
+        return "%.1fh" % hours
+    if hours < 48:
+        return "%dh" % int(round(hours))
+    return "%.1fd" % (hours / 24.0)
+
+
+def size_bucket(nodes):
+    nodes = int(nodes or 1)
+    if nodes <= 1:
+        return "1 node"
+    if nodes <= 4:
+        return "2-4 node"
+    if nodes <= 8:
+        return "5-8 node"
+    return "9+ node"
+
+
+def percentile(sorted_vals, frac):
+    if not sorted_vals:
+        return 0
+    idx = int(round(frac * (len(sorted_vals) - 1)))
+    return sorted_vals[max(0, min(idx, len(sorted_vals) - 1))]
+
+
 def rel(epoch, now):
     if not epoch:
         return ""
@@ -211,6 +272,7 @@ def fetch_active(user):
             "state": state,
             "reason": (j.get("state_reason") or "").strip(),
             "partition": j.get("partition") or "",
+            "priority": num(j.get("priority")),
             "nodes": num(j.get("node_count")),
             "nodelist": j.get("nodes") or "",
             "gpus": gpus_from_tres(tres),
@@ -275,10 +337,148 @@ def fetch_finished(user, since_epoch, tz):
     return jobs
 
 
+class QueueContext(object):
+    """Queue position and historical wait times, both measured, never modelled.
+
+    Position ranks the partition's pending jobs by *priority*, not arrival order:
+    Slurm is multifactor + backfill, so submission order means little.
+
+    Typical wait reports the observed distribution of past queue waits for jobs of
+    a similar size on the same partition. It is deliberately a median and a p90
+    rather than a point estimate -- on a fairshare cluster the spread between them
+    is usually more than an order of magnitude, and a single number would imply a
+    confidence the scheduler does not have.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.days = cfg.get("wait_stats_days", 21)
+        self.min_sample = cfg.get("wait_stats_min_sample", 10)
+        self._queues = {}
+        self._waits = None
+
+    @staticmethod
+    def _first_partition(name):
+        return (name or "").split(",")[0].strip()
+
+    # -- queue position ---------------------------------------------------
+    def _queue(self, partition):
+        if partition not in self._queues:
+            rows = []
+            try:
+                proc = subprocess.run(
+                    ["squeue", "-p", partition, "-h", "-t", "PD", "-o", "%Q|%D|%l"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                if proc.returncode == 0:
+                    for line in proc.stdout.decode().splitlines():
+                        bits = line.split("|")
+                        if len(bits) < 3:
+                            continue
+                        try:
+                            prio = int(bits[0])
+                            nodes = int(bits[1])
+                        except ValueError:
+                            continue
+                        rows.append((prio, nodes, parse_slurm_duration(bits[2])))
+            except Exception as exc:
+                log("queue position lookup failed for %s: %s" % (partition, exc))
+            self._queues[partition] = rows
+        return self._queues[partition]
+
+    def position(self, job):
+        partition = self._first_partition(job.get("partition"))
+        rows = self._queue(partition)
+        if not rows:
+            return None
+        prio = job.get("priority") or 0
+        ahead = [r for r in rows if r[0] > prio]
+        node_hours = sum(r[1] * r[2] for r in ahead) / 3600.0
+        return {
+            "rank": len(ahead) + 1,
+            "total": len(rows),
+            "ahead": len(ahead),
+            "node_hours": node_hours,
+        }
+
+    # -- historical wait --------------------------------------------------
+    def _load_cache(self):
+        try:
+            with open(CACHE_PATH) as fh:
+                cache = json.load(fh)
+        except Exception:
+            return None
+        if cache.get("days") != self.days:
+            return None
+        if time.time() - cache.get("computed", 0) > 86400:
+            return None
+        return cache.get("buckets")
+
+    def _store_cache(self, buckets):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = CACHE_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"computed": int(time.time()), "days": self.days,
+                           "buckets": buckets}, fh, indent=2)
+            os.replace(tmp, CACHE_PATH)
+        except Exception as exc:
+            log("wait-stats cache write failed: %s" % exc)
+
+    def _compute_waits(self, partitions):
+        """One sacct pass over every partition we care about, bucketed by size."""
+        samples = {}
+        try:
+            proc = subprocess.run(
+                ["sacct", "-a", "-r", ",".join(sorted(partitions)), "-X",
+                 "-S", "now-%ddays" % self.days, "-n", "-P",
+                 "-o", "Partition,NNodes,Planned,State"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            if proc.returncode != 0:
+                log("sacct wait-stats failed: %s" % proc.stderr.decode()[:200])
+                return {}
+            for line in proc.stdout.decode().splitlines():
+                bits = line.split("|")
+                if len(bits) < 4 or bits[3].startswith("PENDING"):
+                    continue
+                try:
+                    nodes = int(bits[1])
+                except ValueError:
+                    continue
+                key = "%s/%s" % (bits[0], size_bucket(nodes))
+                samples.setdefault(key, []).append(parse_slurm_duration(bits[2]) / 3600.0)
+        except Exception as exc:
+            log("wait-stats computation failed: %s" % exc)
+            return {}
+        buckets = {}
+        for key, vals in samples.items():
+            vals.sort()
+            buckets[key] = {"n": len(vals),
+                            "median": percentile(vals, 0.5),
+                            "p90": percentile(vals, 0.9)}
+        return buckets
+
+    def typical_wait(self, job, all_partitions):
+        if self._waits is None:
+            cached = self._load_cache()
+            if cached is None:
+                cached = self._compute_waits(all_partitions)
+                if cached:
+                    self._store_cache(cached)
+            self._waits = cached or {}
+        partition = self._first_partition(job.get("partition"))
+        bucket = size_bucket(job.get("nodes"))
+        stat = self._waits.get("%s/%s" % (partition, bucket))
+        if not stat or stat["n"] < self.min_sample:
+            return None
+        stat = dict(stat)
+        stat["bucket"] = bucket
+        return stat
+
+
 # --------------------------------------------------------------------------
 # rendering
 # --------------------------------------------------------------------------
-def job_lines(job, now, tz, prev_state):
+def job_lines(job, now, tz, prev_state, ctx=None, partitions=None):
     """Return (headline, detail lines) for one job, in Slack mrkdwn."""
     state = job["state"]
     icon = STATE_ICON.get(state, ":white_circle:")
@@ -312,6 +512,21 @@ def job_lines(job, now, tz, prev_state):
         else:
             waited = fmt_dur(now - job["submit"]) if job["submit"] else "?"
             lines.append("est. start: unknown — queued %s, scheduler gives no estimate" % waited)
+        if ctx is not None:
+            pos = ctx.position(job)
+            if pos:
+                lines.append("queue position: %s of %d by priority (%d ahead, %s node-h requested)"
+                             % (ordinal(pos["rank"]), pos["total"], pos["ahead"],
+                                format(int(round(pos["node_hours"])), ",")))
+            wait = ctx.typical_wait(job, partitions or set())
+            if wait:
+                line = ("typical wait: %s jobs here — median %s, p90 %s (n=%d, %dd)"
+                        % (wait["bucket"], fmt_hours(wait["median"]),
+                           fmt_hours(wait["p90"]), wait["n"], ctx.days))
+                queued_h = (now - job["submit"]) / 3600.0 if job["submit"] else 0
+                if queued_h > wait["p90"] > 0:
+                    line += " — *already past p90*"
+                lines.append(line)
     elif job["start"]:
         started = "started: %s (%s)" % (fmt_ts(job["start"], tz), rel(job["start"], now))
         if state == "RUNNING":
@@ -344,6 +559,14 @@ def job_lines(job, now, tz, prev_state):
     return headline, lines
 
 
+def ordinal(n):
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, suffix)
+
+
 def build_report(cfg, now, tz, active, finished, prev_states, since_epoch):
     header = "*Slurm report* · %s" % datetime.fromtimestamp(now, tz).strftime(
         "%a %d %b %Y %H:%M %Z")
@@ -359,6 +582,11 @@ def build_report(cfg, now, tz, active, finished, prev_states, since_epoch):
     header += "  —  " + " · ".join(summary_bits)
 
     sections = []
+    ctx = QueueContext(cfg) if cfg.get("queue_context", True) else None
+    partitions = set()
+    for job in active:
+        if job["state"] == "PENDING" and job.get("partition"):
+            partitions.add(job["partition"].split(",")[0].strip())
 
     def order_key(job):
         try:
@@ -368,7 +596,8 @@ def build_report(cfg, now, tz, active, finished, prev_states, since_epoch):
         return (rank, -(job["start"] or 0), job["submit"])
 
     for job in sorted(active, key=order_key):
-        headline, lines = job_lines(job, now, tz, prev_states.get(str(job["job_id"])))
+        headline, lines = job_lines(job, now, tz, prev_states.get(str(job["job_id"])),
+                                    ctx=ctx, partitions=partitions)
         sections.append(headline + "\n" + "\n".join("        " + ln for ln in lines))
 
     if finished:
@@ -389,7 +618,7 @@ def to_plain_text(header, sections):
     def strip(s):
         s = s.replace("*", "").replace("`", "")
         # only unwrap whole-line _italics_, never underscores inside names
-        return re.sub(r"^_(.*)_$", r"\\1", s.strip()) if s.strip().startswith("_") else s
+        return re.sub(r"^_(.*)_$", r"\1", s.strip()) if s.strip().startswith("_") else s
     out = [strip(header), ""]
     for sec in sections:
         for line in sec.split("\n"):
@@ -605,12 +834,22 @@ def main():
         since = state.get("last_run") or (now - cfg["finished_lookback_hours"] * 3600)
 
     active = fetch_active(cfg["user"])
-    finished = fetch_finished(cfg["user"], since, tz)
+    # a broken sacct must not cost you the whole report -- squeue alone still
+    # tells you what is queued and running
+    degraded = ""
+    try:
+        finished = fetch_finished(cfg["user"], since, tz)
+    except Exception as exc:
+        log("sacct lookup failed, reporting active jobs only: %s" % exc)
+        finished = []
+        degraded = "sacct unavailable — finished jobs omitted from this report"
     active_ids = set(str(j["job_id"]) for j in active)
     finished = [j for j in finished if str(j["job_id"]) not in active_ids]
 
     prev_states = state.get("job_states", {})
     header, sections = build_report(cfg, now, tz, active, finished, prev_states, since)
+    if degraded:
+        sections.append("_%s_" % degraded)
 
     result = deliver(cfg, channel, header, sections)
     if not args.dry_run and not args.since:
