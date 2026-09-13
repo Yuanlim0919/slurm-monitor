@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to ~/.config/slurm-monitor/config.json and chmod 600. Never commit the real one.",
+
+  "channel": "slack",
+  "slack_webhook_url": "",
+
+  "email": {
+    "provider": "resend",
+    "api_key": "",
+    "from": "slurm-bot@your-domain.example",
+    "to": "you@example.com"
+  },
+
+  "user": "",
+  "timezone": "Asia/Taipei",
+  "finished_lookback_hours": 14,
+  "max_finished": 15
+}

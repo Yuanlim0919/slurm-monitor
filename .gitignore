@@ -1,0 +1,11 @@
+# Never commit a real config -- it holds your Slack webhook / API key
+config.json
+*.local.json
+
+# Runtime state
+state.json
+*.log
+
+__pycache__/
+*.pyc
+.DS_Store
